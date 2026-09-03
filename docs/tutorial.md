@@ -78,7 +78,7 @@ Now it's your turn! Try to build a basic media player UI.
 2.  **Progress**: A `Slider` to show song progress.
 3.  **Playlist**: A `LazyColumn` below the controls showing a list of filenames.
 
-*Tip: Use `Icons.Default.PlayArrow`, `Icons.Default.Pause`, etc. from the Material library.*
+*Tip: Use a **Column** to stack the major components vertically and a **Row** to arrange the transport controls horizontally. You can also use `Icons.Default.PlayArrow`, `Icons.Default.Pause`, etc. from the Material library.*
 
 Check the `docs/exercise_solution.md` for a reference implementation!
 
