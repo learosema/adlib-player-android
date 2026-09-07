@@ -1,9 +1,15 @@
 package com.example.myapplication
 
 import android.Manifest
+import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.ui.input.pointer.pointerInput
+import android.content.Intent
 import android.content.pm.PackageManager
+import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.os.Environment
+import android.provider.Settings
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
@@ -20,38 +26,74 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.Button
 import androidx.compose.material3.FilledIconButton
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
+import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Slider
+import androidx.compose.material3.SliderDefaults
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.tooling.preview.Preview
+import android.content.ComponentName
+import android.content.Context
+import android.content.ServiceConnection
+import android.os.IBinder
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
 import com.example.myapplication.ui.theme.MyApplicationTheme
-import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.PlayArrow
-import androidx.compose.material.icons.filled.*
-import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.Slider
-import androidx.compose.material3.SliderDefaults
-import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableStateOf
-import androidx.compose.runtime.remember
-import androidx.compose.runtime.setValue
+import kotlinx.coroutines.delay
 
 class MainActivity : ComponentActivity() {
+    private var playbackService: PlaybackService? = null
+    private var isBound = false
+
+    private val connection = object : ServiceConnection {
+        override fun onServiceConnected(name: ComponentName?, service: IBinder?) {
+            val binder = service as PlaybackService.LocalBinder
+            playbackService = binder.getService()
+            isBound = true
+        }
+
+        override fun onServiceDisconnected(name: ComponentName?) {
+            isBound = false
+            playbackService = null
+        }
+    }
+
+    override fun onStart() {
+        super.onStart()
+        Intent(this, PlaybackService::class.java).also { intent ->
+            bindService(intent, connection, Context.BIND_AUTO_CREATE)
+        }
+    }
+
+    override fun onStop() {
+        super.onStop()
+        if (isBound) {
+            unbindService(connection)
+            isBound = false
+        }
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
@@ -60,6 +102,9 @@ class MainActivity : ComponentActivity() {
                 Scaffold(modifier = Modifier.fillMaxSize()) { innerPadding ->
                     val context = LocalContext.current
                     var songs by remember { mutableStateOf(emptyList<Song>()) }
+                    var currentProgress by remember { mutableStateOf(0f) }
+                    var isPlaying by remember { mutableStateOf(false) }
+
                     val permission = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
                         Manifest.permission.READ_MEDIA_AUDIO
                     } else {
@@ -75,17 +120,78 @@ class MainActivity : ComponentActivity() {
                     }
 
                     LaunchedEffect(Unit) {
-                        if (ContextCompat.checkSelfPermission(context, permission) == PackageManager.PERMISSION_GRANTED) {
-                            songs = SongScanner(context).scanDocuments()
+                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                            if (!Environment.isExternalStorageManager()) {
+                                try {
+                                    val intent = Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION)
+                                    intent.data = Uri.parse("package:${context.packageName}")
+                                    context.startActivity(intent)
+                                } catch (e: Exception) {
+                                    val intent = Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION)
+                                    context.startActivity(intent)
+                                }
+                            } else {
+                                songs = SongScanner(context).scanDocuments()
+                            }
                         } else {
-                            launcher.launch(permission)
+                            if (ContextCompat.checkSelfPermission(context, permission) == PackageManager.PERMISSION_GRANTED) {
+                                songs = SongScanner(context).scanDocuments()
+                            } else {
+                                launcher.launch(permission)
+                            }
+                        }
+                    }
+
+                    LaunchedEffect(Unit) {
+                        while (true) {
+                            val servicePlaying = playbackService?.audioPlayer?.isPlaying ?: false
+                            if (isPlaying != servicePlaying) {
+                                isPlaying = servicePlaying
+                            }
+                            if (servicePlaying) {
+                                currentProgress = playbackService?.audioPlayer?.getProgress() ?: 0f
+                            }
+                            delay(500)
                         }
                     }
 
                     AdlibMediaPlayer(
                         songs = songs,
+                        progress = currentProgress,
+                        isPlaying = isPlaying,
                         onRescan = {
                             songs = SongScanner(context).scanDocuments()
+                        },
+                        onPlayPause = { song ->
+                            if (isPlaying) {
+                                playbackService?.stopPlayback()
+                            } else {
+                                val intent = Intent(context, PlaybackService::class.java)
+                                intent.putExtra("PATH", song.path)
+                                ContextCompat.startForegroundService(context, intent)
+                            }
+                        },
+                        onSongPlay = { song ->
+                            val intent = Intent(context, PlaybackService::class.java)
+                            intent.putExtra("PATH", song.path)
+                            ContextCompat.startForegroundService(context, intent)
+                        },
+                        onSeek = { progress ->
+                            playbackService?.audioPlayer?.seek(progress)
+                            currentProgress = progress
+                        },
+                        onForward = {
+                            val newProgress = (currentProgress + 0.1f).coerceAtMost(1f)
+                            playbackService?.audioPlayer?.seek(newProgress)
+                            currentProgress = newProgress
+                        },
+                        onRewind = {
+                            val newProgress = (currentProgress - 0.1f).coerceAtLeast(0f)
+                            playbackService?.audioPlayer?.seek(newProgress)
+                            currentProgress = newProgress
+                        },
+                        onStop = {
+                            playbackService?.stopPlayback()
                         },
                         modifier = Modifier.padding(innerPadding),
                     )
@@ -105,7 +211,6 @@ fun Greeting(name: String, modifier: Modifier = Modifier) {
             contentAlignment = Alignment.Center,
             modifier = Modifier.fillMaxSize()
         ) {
-            // Adapt font size based on the available width
             val adaptiveFontSize = (maxWidth.value / 6).sp
             Text(
                 text = "Moin $name!",
@@ -114,9 +219,7 @@ fun Greeting(name: String, modifier: Modifier = Modifier) {
                 textAlign = TextAlign.Center,
                 lineHeight = adaptiveFontSize * 1.2f
             )
-
         }
-
     }
 }
 
@@ -145,10 +248,17 @@ fun GreetingWithButton(name: String) {
 @Composable
 fun AdlibMediaPlayer(
     songs: List<Song>,
+    progress: Float,
+    isPlaying: Boolean,
     onRescan: () -> Unit,
+    onPlayPause: (Song) -> Unit,
+    onSongPlay: (Song) -> Unit,
+    onSeek: (Float) -> Unit,
+    onForward: () -> Unit,
+    onRewind: () -> Unit,
+    onStop: () -> Unit,
     modifier: Modifier = Modifier
 ) {
-    var progress by remember { mutableStateOf(0.4f) }
     var selectedSongIndex by remember { mutableStateOf(0) }
 
     Surface(
@@ -183,19 +293,43 @@ fun AdlibMediaPlayer(
                 songs = songs,
                 selectedSongIndex = selectedSongIndex,
                 onSongSelect = { selectedSongIndex = it },
+                onSongPlay = { index ->
+                    selectedSongIndex = index
+                    onSongPlay(songs[index])
+                },
                 modifier = Modifier.weight(1f)
             )
-            val currentSongTitle = if (songs.isNotEmpty() && selectedSongIndex < songs.size) {
-                songs[selectedSongIndex].title
+            val currentSong = if (songs.isNotEmpty() && selectedSongIndex < songs.size) {
+                songs[selectedSongIndex]
             } else {
-                "No Songs Found"
+                null
             }
             PlaybackProgress(
-                songTitle = currentSongTitle,
+                songTitle = currentSong?.title ?: "No Songs Found",
                 progress = progress,
-                onProgressChange = { progress = it }
+                onProgressChange = onSeek
             )
-            PlayerControls()
+            PlayerControls(
+                isPlaying = isPlaying,
+                onPlayPause = {
+                    currentSong?.let { onPlayPause(it) }
+                },
+                onNext = {
+                    if (songs.isNotEmpty()) {
+                        selectedSongIndex = (selectedSongIndex + 1) % songs.size
+                        onSongPlay(songs[selectedSongIndex])
+                    }
+                },
+                onPrevious = {
+                    if (songs.isNotEmpty()) {
+                        selectedSongIndex = if (selectedSongIndex > 0) selectedSongIndex - 1 else songs.size - 1
+                        onSongPlay(songs[selectedSongIndex])
+                    }
+                },
+                onForward = onForward,
+                onRewind = onRewind,
+                onStop = onStop
+            )
         }
     }
 }
@@ -231,7 +365,16 @@ fun PlaybackProgress(
 }
 
 @Composable
-fun PlayerControls(modifier: Modifier = Modifier) {
+fun PlayerControls(
+    isPlaying: Boolean,
+    onPlayPause: () -> Unit,
+    onNext: () -> Unit,
+    onPrevious: () -> Unit,
+    onForward: () -> Unit,
+    onRewind: () -> Unit,
+    onStop: () -> Unit,
+    modifier: Modifier = Modifier
+) {
     Surface(
         modifier = modifier.fillMaxWidth(),
         color = Color.Black
@@ -245,14 +388,14 @@ fun PlayerControls(modifier: Modifier = Modifier) {
                 Alignment.CenterHorizontally
             )
         ) {
-            IconButton(onClick = {}) {
+            IconButton(onClick = onPrevious) {
                 Icon(
                     imageVector = Icons.Default.SkipPrevious,
                     contentDescription = "Previous",
                     tint = Color.White
                 )
             }
-            IconButton(onClick = {}) {
+            IconButton(onClick = onRewind) {
                 Icon(
                     imageVector = Icons.Default.FastRewind,
                     contentDescription = "Rewind",
@@ -260,29 +403,29 @@ fun PlayerControls(modifier: Modifier = Modifier) {
                 )
             }
             FilledIconButton(
-                onClick = {},
+                onClick = onPlayPause,
                 modifier = Modifier.size(48.dp)
             ) {
                 Icon(
-                    imageVector = Icons.Default.PlayArrow,
-                    contentDescription = "Play"
+                    imageVector = if (isPlaying) Icons.Default.Pause else Icons.Default.PlayArrow,
+                    contentDescription = if (isPlaying) "Pause" else "Play"
                 )
             }
-            IconButton(onClick = {}) {
+            IconButton(onClick = onForward) {
                 Icon(
                     imageVector = Icons.Default.FastForward,
                     contentDescription = "Forward",
                     tint = Color.White
                 )
             }
-            IconButton(onClick = {}) {
+            IconButton(onClick = onNext) {
                 Icon(
                     imageVector = Icons.Default.SkipNext,
                     contentDescription = "Next",
                     tint = Color.White
                 )
             }
-            IconButton(onClick = {}) {
+            IconButton(onClick = onStop) {
                 Icon(
                     imageVector = Icons.Default.Stop,
                     contentDescription = "Stop",
@@ -298,6 +441,7 @@ fun PlaylistView(
     songs: List<Song>,
     selectedSongIndex: Int,
     onSongSelect: (Int) -> Unit,
+    onSongPlay: (Int) -> Unit,
     modifier: Modifier = Modifier
 ) {
     LazyColumn(
@@ -307,7 +451,8 @@ fun PlaylistView(
             PlaylistItem(
                 song = songs[index].title,
                 isSelected = index == selectedSongIndex,
-                onClick = { onSongSelect(index) }
+                onClick = { onSongSelect(index) },
+                onDoubleClick = { onSongPlay(index) }
             )
         }
     }
@@ -318,6 +463,7 @@ fun PlaylistItem(
     song: String,
     isSelected: Boolean,
     onClick: () -> Unit,
+    onDoubleClick: () -> Unit,
     modifier: Modifier = Modifier
 ) {
     val backgroundColor = if (isSelected) Color.White.copy(alpha = 0.1f) else Color.Transparent
@@ -326,7 +472,12 @@ fun PlaylistItem(
         modifier = modifier
             .fillMaxWidth()
             .background(backgroundColor)
-            .clickable { onClick() }
+            .pointerInput(Unit) {
+                detectTapGestures(
+                    onTap = { onClick() },
+                    onDoubleTap = { onDoubleClick() }
+                )
+            }
     ) {
         HorizontalDivider(color = Color.Gray.copy(alpha = 0.5f))
         Text(
@@ -343,11 +494,17 @@ fun PlaylistItem(
 @Composable
 fun GreetingPreview() {
     MyApplicationTheme {
-        // Greeting("Lea")
-        // GreetingWithButton("Lea")
         AdlibMediaPlayer(
             songs = listOf(Song("Sample Song", "/path/to/song.mid")),
-            onRescan = {}
+            progress = 0.5f,
+            isPlaying = false,
+            onRescan = {},
+            onPlayPause = {},
+            onSongPlay = {},
+            onSeek = {},
+            onForward = {},
+            onRewind = {},
+            onStop = {}
         )
     }
 }
