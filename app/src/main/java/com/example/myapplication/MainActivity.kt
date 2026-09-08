@@ -9,6 +9,7 @@ import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.os.Environment
+import android.util.Log
 import android.provider.Settings
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -59,39 +60,35 @@ import android.os.IBinder
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
+import androidx.media3.common.MediaItem
+import androidx.media3.common.MediaMetadata
+import androidx.media3.session.MediaController
+import androidx.media3.session.SessionToken
+import com.google.common.util.concurrent.ListenableFuture
 import com.example.myapplication.ui.theme.MyApplicationTheme
 import kotlinx.coroutines.delay
 
 class MainActivity : ComponentActivity() {
-    private var playbackService: PlaybackService? = null
-    private var isBound = false
-
-    private val connection = object : ServiceConnection {
-        override fun onServiceConnected(name: ComponentName?, service: IBinder?) {
-            val binder = service as PlaybackService.LocalBinder
-            playbackService = binder.getService()
-            isBound = true
-        }
-
-        override fun onServiceDisconnected(name: ComponentName?) {
-            isBound = false
-            playbackService = null
-        }
-    }
+    private var controllerFuture: ListenableFuture<MediaController>? = null
+    private var mediaController: MediaController? = null
 
     override fun onStart() {
         super.onStart()
-        Intent(this, PlaybackService::class.java).also { intent ->
-            bindService(intent, connection, Context.BIND_AUTO_CREATE)
-        }
+        val sessionToken = SessionToken(this, ComponentName(this, PlaybackService::class.java))
+        controllerFuture = MediaController.Builder(this, sessionToken).buildAsync()
+        controllerFuture?.addListener({
+            try {
+                mediaController = controllerFuture?.get()
+            } catch (e: Exception) {
+                Log.e("MainActivity", "Failed to get MediaController", e)
+            }
+        }, ContextCompat.getMainExecutor(this))
     }
 
     override fun onStop() {
         super.onStop()
-        if (isBound) {
-            unbindService(connection)
-            isBound = false
-        }
+        controllerFuture?.let { MediaController.releaseFuture(it) }
+        mediaController = null
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -104,6 +101,9 @@ class MainActivity : ComponentActivity() {
                     var songs by remember { mutableStateOf(emptyList<Song>()) }
                     var currentProgress by remember { mutableStateOf(0f) }
                     var isPlaying by remember { mutableStateOf(false) }
+                    var uiSelectedSongIndex by remember { mutableStateOf(0) }
+                    var currentTrackIndex by remember { mutableStateOf(0) }
+                    var tracksCount by remember { mutableStateOf(1) }
 
                     val permission = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
                         Manifest.permission.READ_MEDIA_AUDIO
@@ -116,6 +116,16 @@ class MainActivity : ComponentActivity() {
                     ) { isGranted ->
                         if (isGranted) {
                             songs = SongScanner(context).scanDocuments()
+                        }
+                    }
+
+                    val mediaItems = remember(songs) {
+                        songs.map { s ->
+                            MediaItem.Builder()
+                                .setMediaId(s.path)
+                                .setUri(Uri.parse(s.path))
+                                .setMediaMetadata(MediaMetadata.Builder().setTitle(s.title).build())
+                                .build()
                         }
                     }
 
@@ -142,14 +152,17 @@ class MainActivity : ComponentActivity() {
                         }
                     }
 
-                    LaunchedEffect(Unit) {
+                    LaunchedEffect(mediaController) {
                         while (true) {
-                            val servicePlaying = playbackService?.audioPlayer?.isPlaying ?: false
-                            if (isPlaying != servicePlaying) {
-                                isPlaying = servicePlaying
-                            }
-                            if (servicePlaying) {
-                                currentProgress = playbackService?.audioPlayer?.getProgress() ?: 0f
+                            mediaController?.let { controller ->
+                                isPlaying = controller.isPlaying
+                                val duration = controller.duration
+                                if (duration > 0) {
+                                    currentProgress = controller.currentPosition.toFloat() / duration.toFloat()
+                                }
+                                if (isPlaying) {
+                                    uiSelectedSongIndex = controller.currentMediaItemIndex
+                                }
                             }
                             delay(500)
                         }
@@ -159,39 +172,66 @@ class MainActivity : ComponentActivity() {
                         songs = songs,
                         progress = currentProgress,
                         isPlaying = isPlaying,
+                        selectedSongIndex = uiSelectedSongIndex,
+                        onSongSelect = { index ->
+                            uiSelectedSongIndex = index
+                            val controller = mediaController ?: return@AdlibMediaPlayer
+                            controller.setMediaItems(mediaItems, index, 0L)
+                            controller.prepare()
+                            controller.play()
+                        },
                         onRescan = {
                             songs = SongScanner(context).scanDocuments()
                         },
                         onPlayPause = { song ->
+                            val controller = mediaController ?: return@AdlibMediaPlayer
                             if (isPlaying) {
-                                playbackService?.stopPlayback()
+                                controller.pause()
                             } else {
-                                val intent = Intent(context, PlaybackService::class.java)
-                                intent.putExtra("PATH", song.path)
-                                ContextCompat.startForegroundService(context, intent)
+                                if (controller.currentMediaItem?.mediaId == song.path) {
+                                    controller.play()
+                                } else {
+                                    val index = songs.indexOf(song).coerceAtLeast(0)
+                                    controller.setMediaItems(mediaItems, index, 0L)
+                                    controller.prepare()
+                                    controller.play()
+                                }
                             }
                         },
-                        onSongPlay = { song ->
-                            val intent = Intent(context, PlaybackService::class.java)
-                            intent.putExtra("PATH", song.path)
-                            ContextCompat.startForegroundService(context, intent)
-                        },
                         onSeek = { progress ->
-                            playbackService?.audioPlayer?.seek(progress)
+                            mediaController?.let { controller ->
+                                val duration = controller.duration
+                                if (duration > 0) {
+                                    controller.seekTo((progress * duration).toLong())
+                                }
+                            }
                             currentProgress = progress
                         },
                         onForward = {
-                            val newProgress = (currentProgress + 0.1f).coerceAtMost(1f)
-                            playbackService?.audioPlayer?.seek(newProgress)
-                            currentProgress = newProgress
+                            mediaController?.let { controller ->
+                                val duration = controller.duration
+                                val current = controller.currentPosition
+                                if (duration > 0) {
+                                    val newPos = (current + 10000L).coerceAtMost(duration)
+                                    controller.seekTo(newPos)
+                                }
+                            }
                         },
                         onRewind = {
-                            val newProgress = (currentProgress - 0.1f).coerceAtLeast(0f)
-                            playbackService?.audioPlayer?.seek(newProgress)
-                            currentProgress = newProgress
+                            mediaController?.let { controller ->
+                                val current = controller.currentPosition
+                                val newPos = (current - 10000L).coerceAtLeast(0L)
+                                controller.seekTo(newPos)
+                            }
+                        },
+                        onNext = {
+                            mediaController?.seekToNext()
+                        },
+                        onPrevious = {
+                            mediaController?.seekToPrevious()
                         },
                         onStop = {
-                            playbackService?.stopPlayback()
+                            mediaController?.stop()
                         },
                         modifier = Modifier.padding(innerPadding),
                     )
@@ -250,17 +290,18 @@ fun AdlibMediaPlayer(
     songs: List<Song>,
     progress: Float,
     isPlaying: Boolean,
+    selectedSongIndex: Int,
+    onSongSelect: (Int) -> Unit,
     onRescan: () -> Unit,
     onPlayPause: (Song) -> Unit,
-    onSongPlay: (Song) -> Unit,
+    onNext: () -> Unit,
+    onPrevious: () -> Unit,
     onSeek: (Float) -> Unit,
     onForward: () -> Unit,
     onRewind: () -> Unit,
     onStop: () -> Unit,
     modifier: Modifier = Modifier
 ) {
-    var selectedSongIndex by remember { mutableStateOf(0) }
-
     Surface(
         color = Color.Black,
         modifier = modifier.fillMaxSize()
@@ -292,11 +333,7 @@ fun AdlibMediaPlayer(
             PlaylistView(
                 songs = songs,
                 selectedSongIndex = selectedSongIndex,
-                onSongSelect = { selectedSongIndex = it },
-                onSongPlay = { index ->
-                    selectedSongIndex = index
-                    onSongPlay(songs[index])
-                },
+                onSongSelect = onSongSelect,
                 modifier = Modifier.weight(1f)
             )
             val currentSong = if (songs.isNotEmpty() && selectedSongIndex < songs.size) {
@@ -314,18 +351,8 @@ fun AdlibMediaPlayer(
                 onPlayPause = {
                     currentSong?.let { onPlayPause(it) }
                 },
-                onNext = {
-                    if (songs.isNotEmpty()) {
-                        selectedSongIndex = (selectedSongIndex + 1) % songs.size
-                        onSongPlay(songs[selectedSongIndex])
-                    }
-                },
-                onPrevious = {
-                    if (songs.isNotEmpty()) {
-                        selectedSongIndex = if (selectedSongIndex > 0) selectedSongIndex - 1 else songs.size - 1
-                        onSongPlay(songs[selectedSongIndex])
-                    }
-                },
+                onNext = onNext,
+                onPrevious = onPrevious,
                 onForward = onForward,
                 onRewind = onRewind,
                 onStop = onStop
@@ -441,7 +468,6 @@ fun PlaylistView(
     songs: List<Song>,
     selectedSongIndex: Int,
     onSongSelect: (Int) -> Unit,
-    onSongPlay: (Int) -> Unit,
     modifier: Modifier = Modifier
 ) {
     LazyColumn(
@@ -451,8 +477,7 @@ fun PlaylistView(
             PlaylistItem(
                 song = songs[index].title,
                 isSelected = index == selectedSongIndex,
-                onClick = { onSongSelect(index) },
-                onDoubleClick = { onSongPlay(index) }
+                onClick = { onSongSelect(index) }
             )
         }
     }
@@ -463,7 +488,6 @@ fun PlaylistItem(
     song: String,
     isSelected: Boolean,
     onClick: () -> Unit,
-    onDoubleClick: () -> Unit,
     modifier: Modifier = Modifier
 ) {
     val backgroundColor = if (isSelected) Color.White.copy(alpha = 0.1f) else Color.Transparent
@@ -472,12 +496,7 @@ fun PlaylistItem(
         modifier = modifier
             .fillMaxWidth()
             .background(backgroundColor)
-            .pointerInput(Unit) {
-                detectTapGestures(
-                    onTap = { onClick() },
-                    onDoubleTap = { onDoubleClick() }
-                )
-            }
+            .clickable { onClick() }
     ) {
         HorizontalDivider(color = Color.Gray.copy(alpha = 0.5f))
         Text(
@@ -498,9 +517,12 @@ fun GreetingPreview() {
             songs = listOf(Song("Sample Song", "/path/to/song.mid")),
             progress = 0.5f,
             isPlaying = false,
+            selectedSongIndex = 0,
+            onSongSelect = {},
             onRescan = {},
             onPlayPause = {},
-            onSongPlay = {},
+            onNext = {},
+            onPrevious = {},
             onSeek = {},
             onForward = {},
             onRewind = {},

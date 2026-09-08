@@ -10,6 +10,11 @@ add_library(
         SHARED
         native-lib.cpp)
 
+target_include_directories(
+        myapplication
+        PRIVATE
+        libADLMIDI/src)
+
 target_link_libraries(
         myapplication
         ADLMIDI

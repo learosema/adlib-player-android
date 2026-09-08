@@ -25,4 +25,9 @@ class AdlMidi {
     external fun setHVibrato(device: Long, enabled: Int)
     external fun setHTremolo(device: Long, enabled: Int)
     external fun setLoopEnabled(device: Long, enabled: Int)
+    external fun selectSongNum(device: Long, songNumber: Int)
+    external fun getSongsCount(device: Long): Int
+    external fun extractXmiTracks(xmiData: ByteArray): Array<ByteArray>?
+    external fun getBankNames(): Array<String>
+    external fun setBank(device: Long, bank: Int): Int
 }

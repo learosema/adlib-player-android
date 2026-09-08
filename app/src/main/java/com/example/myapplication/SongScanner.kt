@@ -17,7 +17,7 @@ class SongScanner(private val context: Context) {
         }
 
         val results = mutableListOf<Song>()
-        val extensions = listOf(".mid", ".cmf", ".mus", ".hmi", ".hmp", ".imf")
+        val extensions = listOf(".mid", ".cmf", ".mus", ".hmi", ".hmp", ".imf", ".xmi")
         
         fun scan(file: File) {
             if (file.isDirectory) {
