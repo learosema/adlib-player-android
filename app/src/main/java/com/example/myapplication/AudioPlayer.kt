@@ -53,11 +53,19 @@ class AudioPlayer {
             // device/audioTrack fields if they still hold what THIS thread published there.
             fun cleanup() {
                 synchronized(playbackLock) {
+                    // "Do I still own the shared fields" and "am I still the newest request"
+                    // are different questions. A thread that just got superseded by a newer
+                    // play() call still needs to clear the fields it published (if the newer
+                    // thread hasn't published yet) - but must NOT report a real stop, since
+                    // playback isn't stopping, it's transitioning to the new song.
+                    val isNewestRequest = myGeneration == playbackGeneration
                     if (publishedGeneration == myGeneration) {
-                        isPlaying = false
                         device = 0L
                         audioTrack = null
                         publishedGeneration = -1L
+                    }
+                    if (isNewestRequest) {
+                        isPlaying = false
                         onPlaybackStopped?.invoke()
                     }
                     localTrack?.stop()
@@ -72,7 +80,7 @@ class AudioPlayer {
 
                     localDevice = adlMidi.init(sampleRate)
                     if (localDevice == 0L) {
-                        isPlaying = false
+                        cleanup()
                         return@thread
                     }
 
@@ -118,9 +126,7 @@ class AudioPlayer {
                     }
 
                     if (openResult != 0) {
-                        adlMidi.close(localDevice)
-                        localDevice = 0L
-                        isPlaying = false
+                        cleanup()
                         return@thread
                     }
 
