@@ -549,7 +549,10 @@ fun PlaylistView(
     val listState = rememberLazyListState()
 
     LaunchedEffect(cursorIndex) {
-        if (cursorIndex in songs.indices) {
+        // Only scroll when the cursor actually moves off-screen (keyboard navigation past the
+        // visible area) - a tap on a row that's already visible shouldn't cause any scrolling.
+        val alreadyVisible = listState.layoutInfo.visibleItemsInfo.any { it.index == cursorIndex }
+        if (cursorIndex in songs.indices && !alreadyVisible) {
             listState.animateScrollToItem(cursorIndex)
         }
     }
