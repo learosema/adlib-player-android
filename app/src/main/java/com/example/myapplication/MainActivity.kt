@@ -54,6 +54,7 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -109,8 +110,8 @@ class MainActivity : ComponentActivity() {
                     var songs by remember { mutableStateOf(emptyList<Song>()) }
                     var currentProgress by remember { mutableStateOf(0f) }
                     var isPlaying by remember { mutableStateOf(false) }
-                    var uiSelectedSongIndex by remember { mutableStateOf(0) }
-                    var cursorIndex by remember { mutableStateOf(0) }
+                    var uiSelectedSongIndex by rememberSaveable { mutableStateOf(0) }
+                    var cursorIndex by rememberSaveable { mutableStateOf(0) }
                     var currentTrackIndex by remember { mutableStateOf(0) }
                     var tracksCount by remember { mutableStateOf(1) }
 
@@ -316,12 +317,13 @@ fun AdlibMediaPlayer(
     onStop: () -> Unit,
     modifier: Modifier = Modifier
 ) {
-    val currentSong = if (songs.isNotEmpty() && selectedSongIndex < songs.size) {
-        songs[selectedSongIndex]
-    } else {
-        null
-    }
-    val triggerPlayPause = { currentSong?.let { onPlayPause(it) }; Unit }
+    val playingSong = songs.getOrNull(selectedSongIndex)
+    // The play button should act on wherever the cursor is pointing, not on whatever last
+    // played - e.g. moving the cursor to a different song and hitting play should play THAT
+    // song, not resume/restart the previously playing one. Pausing still just pauses whatever
+    // is currently audible, since onPlayPause() ignores the song argument in that branch.
+    val cursorSong = songs.getOrNull(cursorIndex)
+    val triggerPlayPause = { cursorSong?.let { onPlayPause(it) }; Unit }
     val focusRequester = remember { FocusRequester() }
 
     LaunchedEffect(Unit) {
@@ -418,7 +420,7 @@ fun AdlibMediaPlayer(
                 modifier = Modifier.weight(1f)
             )
             PlaybackProgress(
-                songTitle = currentSong?.title ?: "No Songs Found",
+                songTitle = playingSong?.title ?: "No Songs Found",
                 progress = progress,
                 onProgressChange = onSeek
             )
