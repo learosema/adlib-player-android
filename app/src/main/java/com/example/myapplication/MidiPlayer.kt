@@ -13,6 +13,13 @@ import com.google.common.util.concurrent.ListenableFuture
 class MidiPlayer(private val audioPlayer: AudioPlayer) : SimpleBasePlayer(Looper.getMainLooper()) {
     private var mediaItems = mutableListOf<MediaItem>()
     private var currentIndex = 0
+    // Which item index audioPlayer.play() was last actually called for. A single logical
+    // "select and play this song" action from a controller can invoke handleSetMediaItems(),
+    // handlePrepare() and handleSetPlayWhenReady() back to back, and each of them calls
+    // playCurrent() independently. Without this guard, that fires audioPlayer.play() up to
+    // three times for the exact same song, each restart immediately cutting off the previous
+    // one's native device and AudioTrack.
+    private var lastRequestedIndex = -1
     private var playWhenReady = false
     private var playbackState = Player.STATE_IDLE
     private val handler = Handler(Looper.getMainLooper())
@@ -142,8 +149,12 @@ class MidiPlayer(private val audioPlayer: AudioPlayer) : SimpleBasePlayer(Looper
 
     private fun playCurrent() {
         if (mediaItems.isEmpty()) return
+        // Already playing (or already starting) this exact item - nothing to do. audioPlayer.isPlaying
+        // is set synchronously before play() returns, so this reliably reflects an in-flight attempt too.
+        if (currentIndex == lastRequestedIndex && audioPlayer.isPlaying) return
         val path = mediaItems[currentIndex].localConfiguration?.uri?.path
         if (path != null) {
+            lastRequestedIndex = currentIndex
             audioPlayer.play(path)
         }
     }
