@@ -17,7 +17,6 @@ import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
-import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
@@ -496,7 +495,9 @@ fun PlaylistItem(
         modifier = modifier
             .fillMaxWidth()
             .background(backgroundColor)
-            .clickable { onClick() }
+            .pointerInput(onClick) {
+                detectTapGestures(onDoubleTap = { onClick() })
+            }
     ) {
         HorizontalDivider(color = Color.Gray.copy(alpha = 0.5f))
         Text(

@@ -24,10 +24,18 @@ class AudioPlayer {
 
     private val playbackLock = Any()
 
-    // Identifies which play() call "owns" the shared device/audioTrack fields right now.
-    // Using a counter instead of the native device pointer avoids ABA bugs: a freed native
-    // pointer can be handed back out by the allocator for the very next adl_init() call.
+    // Identifies which play() call is the newest request. Using a counter instead of the
+    // native device pointer avoids ABA bugs: a freed native pointer can be handed back out
+    // by the allocator for the very next adl_init() call.
     private var playbackGeneration = 0L
+
+    // Which generation's device/audioTrack are currently sitting in the shared fields, if any.
+    // This is deliberately a SEPARATE thing from playbackGeneration: a thread can successfully
+    // publish its device and then be superseded before it runs a single loop iteration. When it
+    // tears down, it must only be allowed to null out the shared fields if they still hold ITS
+    // device - otherwise a live, newer device (or worse, nothing, leaving a dangling pointer to
+    // memory it just freed) could be wiped out or left dangling by the wrong thread.
+    private var publishedGeneration = -1L
 
     fun play(path: String, songNumber: Int = 0) {
         val myGeneration: Long
@@ -40,6 +48,23 @@ class AudioPlayer {
         thread(start = true, name = "MidiPlaybackThread") {
             var localDevice = 0L
             var localTrack: AudioTrack? = null
+
+            // Releases only resources THIS thread allocated, and only clears the shared
+            // device/audioTrack fields if they still hold what THIS thread published there.
+            fun cleanup() {
+                synchronized(playbackLock) {
+                    if (publishedGeneration == myGeneration) {
+                        isPlaying = false
+                        device = 0L
+                        audioTrack = null
+                        publishedGeneration = -1L
+                        onPlaybackStopped?.invoke()
+                    }
+                    localTrack?.stop()
+                    localTrack?.release()
+                    if (localDevice != 0L) adlMidi.close(localDevice)
+                }
+            }
 
             try {
                 synchronized(playbackLock) {
@@ -121,34 +146,20 @@ class AudioPlayer {
                         .build()
 
                     if (myGeneration != playbackGeneration) {
-                        // Superseded while we were setting up; publish nothing, clean up below.
+                        // Superseded while we were setting up; nothing published yet, just
+                        // release what we made ourselves.
+                        cleanup()
                         return@thread
                     }
 
                     localTrack?.play()
                     device = localDevice
                     audioTrack = localTrack
+                    publishedGeneration = myGeneration
                 }
             } catch (e: Exception) {
                 Log.e("AudioPlayer", "Failed to start playback for $path", e)
-                synchronized(playbackLock) {
-                    if (myGeneration == playbackGeneration) {
-                        isPlaying = false
-                        device = 0L
-                        audioTrack = null
-                    }
-                }
-                localTrack?.release()
-                if (localDevice != 0L) adlMidi.close(localDevice)
-                return@thread
-            }
-
-            // If setup didn't successfully publish (early-return paths above already cleaned up
-            // the device, or we got superseded), there's nothing left to play.
-            if (localTrack == null) {
-                if (localDevice != 0L && myGeneration != playbackGeneration) {
-                    adlMidi.close(localDevice)
-                }
+                cleanup()
                 return@thread
             }
 
@@ -173,17 +184,7 @@ class AudioPlayer {
                     }
                 }
             } finally {
-                synchronized(playbackLock) {
-                    if (myGeneration == playbackGeneration) {
-                        isPlaying = false
-                        device = 0L
-                        audioTrack = null
-                        onPlaybackStopped?.invoke()
-                    }
-                }
-                localTrack?.stop()
-                localTrack?.release()
-                adlMidi.close(localDevice)
+                cleanup()
             }
         }
     }
