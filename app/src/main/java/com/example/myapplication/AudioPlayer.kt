@@ -24,39 +24,53 @@ class AudioPlayer {
 
     private val playbackLock = Any()
 
+    // Identifies which play() call "owns" the shared device/audioTrack fields right now.
+    // Using a counter instead of the native device pointer avoids ABA bugs: a freed native
+    // pointer can be handed back out by the allocator for the very next adl_init() call.
+    private var playbackGeneration = 0L
+
     fun play(path: String, songNumber: Int = 0) {
+        val myGeneration: Long
         synchronized(playbackLock) {
             stopInternal()
             isPlaying = true // Set immediately to prevent multiple rapid starts
-            
-            thread(start = true, name = "MidiPlaybackThread") {
+            myGeneration = ++playbackGeneration
+        }
+
+        thread(start = true, name = "MidiPlaybackThread") {
+            var localDevice = 0L
+            var localTrack: AudioTrack? = null
+
+            try {
                 synchronized(playbackLock) {
-                    device = adlMidi.init(sampleRate)
-                    if (device == 0L) {
+                    if (myGeneration != playbackGeneration) return@thread
+
+                    localDevice = adlMidi.init(sampleRate)
+                    if (localDevice == 0L) {
                         isPlaying = false
                         return@thread
                     }
 
-                    adlMidi.setModeEMIDI(device, 1)
-                    adlMidi.switchEmulator(device, 2)
-                    adlMidi.setRunAtPcmRate(device, 1)
-                    adlMidi.setNumChips(device, 1)
-                    adlMidi.setSoftPanEnabled(device, 1)
+                    adlMidi.setModeEMIDI(localDevice, 1)
+                    adlMidi.switchEmulator(localDevice, 2)
+                    adlMidi.setRunAtPcmRate(localDevice, 1)
+                    adlMidi.setNumChips(localDevice, 1)
+                    adlMidi.setSoftPanEnabled(localDevice, 1)
 
                     val bankNames = adlMidi.getBankNames()
                     Log.d("AudioPlayer", "Available banks: ${bankNames.joinToString(", ")}")
-                    
+
                     // Dune 2 / Westwood often uses bank index 58 (Miles) or something similar in newer libADLMIDI
                     // Let's try to find a bank name containing "Miles" or "Westwood"
                     val milesBank = bankNames.indexOfFirst { it.contains("Miles", ignoreCase = true) }
                     if (milesBank != -1) {
                         Log.d("AudioPlayer", "Selecting Miles bank at index $milesBank")
-                        adlMidi.setBank(device, milesBank)
+                        adlMidi.setBank(localDevice, milesBank)
                     }
 
-                    adlMidi.selectSongNum(device, songNumber)
-                    val openResult = adlMidi.openFile(device, path)
-                    val songsCount = adlMidi.getSongsCount(device)
+                    adlMidi.selectSongNum(localDevice, songNumber)
+                    val openResult = adlMidi.openFile(localDevice, path)
+                    val songsCount = adlMidi.getSongsCount(localDevice)
                     Log.d("AudioPlayer", "openFile result: $openResult, songsCount: $songsCount for $path")
 
                     // Heuristic: If we requested track 0 but it's a multi-song file, find the longest track.
@@ -65,8 +79,8 @@ class AudioPlayer {
                         var longestTrack = 0
                         var maxDuration = 0.0
                         for (i in 0 until minOf(songsCount, 100)) {
-                            adlMidi.selectSongNum(device, i)
-                            val duration = adlMidi.totalTimeLength(device)
+                            adlMidi.selectSongNum(localDevice, i)
+                            val duration = adlMidi.totalTimeLength(localDevice)
                             if (duration > maxDuration) {
                                 maxDuration = duration
                                 longestTrack = i
@@ -74,19 +88,19 @@ class AudioPlayer {
                         }
                         if (maxDuration > 0) {
                             Log.d("AudioPlayer", "Auto-selected longest track $longestTrack (duration: $maxDuration s)")
-                            adlMidi.selectSongNum(device, longestTrack)
+                            adlMidi.selectSongNum(localDevice, longestTrack)
                         }
                     }
 
                     if (openResult != 0) {
-                        adlMidi.close(device)
-                        device = 0L
+                        adlMidi.close(localDevice)
+                        localDevice = 0L
                         isPlaying = false
                         return@thread
                     }
 
-                    adlMidi.setVolumeRangeModel(device, 2)
-                    adlMidi.setFullRangeBrightness(device, 1)
+                    adlMidi.setVolumeRangeModel(localDevice, 2)
+                    adlMidi.setFullRangeBrightness(localDevice, 1)
 
                     val audioAttributes = AudioAttributes.Builder()
                         .setUsage(AudioAttributes.USAGE_MEDIA)
@@ -99,62 +113,77 @@ class AudioPlayer {
                         .setChannelMask(AudioFormat.CHANNEL_OUT_STEREO)
                         .build()
 
-                    audioTrack = AudioTrack.Builder()
+                    localTrack = AudioTrack.Builder()
                         .setAudioAttributes(audioAttributes)
                         .setAudioFormat(audioFormat)
                         .setBufferSizeInBytes(bufferSize)
                         .setTransferMode(AudioTrack.MODE_STREAM)
                         .build()
 
-                    audioTrack?.play()
-                }
+                    if (myGeneration != playbackGeneration) {
+                        // Superseded while we were setting up; publish nothing, clean up below.
+                        return@thread
+                    }
 
-                val samples = ShortArray(bufferSize / 2)
-                var currentDevice: Long
-                var currentAudioTrack: AudioTrack?
-                
+                    localTrack?.play()
+                    device = localDevice
+                    audioTrack = localTrack
+                }
+            } catch (e: Exception) {
+                Log.e("AudioPlayer", "Failed to start playback for $path", e)
                 synchronized(playbackLock) {
-                    currentDevice = device
-                    currentAudioTrack = audioTrack
+                    if (myGeneration == playbackGeneration) {
+                        isPlaying = false
+                        device = 0L
+                        audioTrack = null
+                    }
                 }
+                localTrack?.release()
+                if (localDevice != 0L) adlMidi.close(localDevice)
+                return@thread
+            }
 
-                try {
-                    while (isPlaying) {
-                        val read: Int
-                        synchronized(playbackLock) {
-                            if (device != currentDevice || !isPlaying) break
-                            read = adlMidi.play(currentDevice, samples)
-                        }
-                        
-                        if (read > 0) {
-                            for (i in 0 until read) {
-                                val scaled = (samples[i] * gain).toInt()
-                                samples[i] = scaled.coerceIn(-32768, 32767).toShort()
-                            }
-                            currentAudioTrack?.write(samples, 0, read)
-                        } else {
-                            break
-                        }
-                    }
-                } finally {
+            // If setup didn't successfully publish (early-return paths above already cleaned up
+            // the device, or we got superseded), there's nothing left to play.
+            if (localTrack == null) {
+                if (localDevice != 0L && myGeneration != playbackGeneration) {
+                    adlMidi.close(localDevice)
+                }
+                return@thread
+            }
+
+            val samples = ShortArray(bufferSize / 2)
+
+            try {
+                while (isPlaying) {
+                    val read: Int
                     synchronized(playbackLock) {
-                        if (device == currentDevice) {
-                            isPlaying = false
-                            currentAudioTrack?.stop()
-                            currentAudioTrack?.release()
-                            if (audioTrack == currentAudioTrack) audioTrack = null
-                            
-                            adlMidi.close(currentDevice)
-                            device = 0L
-                            onPlaybackStopped?.invoke()
-                        } else {
-                            // Another thread already took over, just clean up local refs
-                            currentAudioTrack?.stop()
-                            currentAudioTrack?.release()
-                            adlMidi.close(currentDevice)
+                        if (myGeneration != playbackGeneration || !isPlaying) return@thread
+                        read = adlMidi.play(localDevice, samples)
+                    }
+
+                    if (read > 0) {
+                        for (i in 0 until read) {
+                            val scaled = (samples[i] * gain).toInt()
+                            samples[i] = scaled.coerceIn(-32768, 32767).toShort()
                         }
+                        localTrack?.write(samples, 0, read)
+                    } else {
+                        break
                     }
                 }
+            } finally {
+                synchronized(playbackLock) {
+                    if (myGeneration == playbackGeneration) {
+                        isPlaying = false
+                        device = 0L
+                        audioTrack = null
+                        onPlaybackStopped?.invoke()
+                    }
+                }
+                localTrack?.stop()
+                localTrack?.release()
+                adlMidi.close(localDevice)
             }
         }
     }
@@ -169,7 +198,7 @@ class AudioPlayer {
         isPlaying = false
         audioTrack?.stop()
     }
-    
+
     fun getDurationMs(): Long {
         synchronized(playbackLock) {
             if (device == 0L) return 0
@@ -185,7 +214,7 @@ class AudioPlayer {
             return (posS * 1000).toLong()
         }
     }
-    
+
     fun getProgress(): Float {
         synchronized(playbackLock) {
             if (device == 0L) return 0f
@@ -194,7 +223,7 @@ class AudioPlayer {
             return (adlMidi.positionTell(device) / total).toFloat()
         }
     }
-    
+
     fun seek(progress: Float) {
         synchronized(playbackLock) {
             if (device == 0L) return
