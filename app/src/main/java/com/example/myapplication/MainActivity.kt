@@ -17,6 +17,15 @@ import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
+import androidx.compose.foundation.focusable
+import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
+import androidx.compose.ui.input.key.Key
+import androidx.compose.ui.input.key.KeyEventType
+import androidx.compose.ui.input.key.key
+import androidx.compose.ui.input.key.onPreviewKeyEvent
+import androidx.compose.ui.input.key.type
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
@@ -101,6 +110,7 @@ class MainActivity : ComponentActivity() {
                     var currentProgress by remember { mutableStateOf(0f) }
                     var isPlaying by remember { mutableStateOf(false) }
                     var uiSelectedSongIndex by remember { mutableStateOf(0) }
+                    var cursorIndex by remember { mutableStateOf(0) }
                     var currentTrackIndex by remember { mutableStateOf(0) }
                     var tracksCount by remember { mutableStateOf(1) }
 
@@ -172,8 +182,11 @@ class MainActivity : ComponentActivity() {
                         progress = currentProgress,
                         isPlaying = isPlaying,
                         selectedSongIndex = uiSelectedSongIndex,
+                        cursorIndex = cursorIndex,
+                        onCursorMove = { index -> cursorIndex = index },
                         onSongSelect = { index ->
                             uiSelectedSongIndex = index
+                            cursorIndex = index
                             val controller = mediaController ?: return@AdlibMediaPlayer
                             controller.setMediaItems(mediaItems, index, 0L)
                             controller.prepare()
@@ -290,6 +303,8 @@ fun AdlibMediaPlayer(
     progress: Float,
     isPlaying: Boolean,
     selectedSongIndex: Int,
+    cursorIndex: Int,
+    onCursorMove: (Int) -> Unit,
     onSongSelect: (Int) -> Unit,
     onRescan: () -> Unit,
     onPlayPause: (Song) -> Unit,
@@ -301,9 +316,74 @@ fun AdlibMediaPlayer(
     onStop: () -> Unit,
     modifier: Modifier = Modifier
 ) {
+    val currentSong = if (songs.isNotEmpty() && selectedSongIndex < songs.size) {
+        songs[selectedSongIndex]
+    } else {
+        null
+    }
+    val triggerPlayPause = { currentSong?.let { onPlayPause(it) }; Unit }
+    val focusRequester = remember { FocusRequester() }
+
+    LaunchedEffect(Unit) {
+        focusRequester.requestFocus()
+    }
+
     Surface(
         color = Color.Black,
-        modifier = modifier.fillMaxSize()
+        modifier = modifier
+            .fillMaxSize()
+            .focusRequester(focusRequester)
+            .focusable()
+            .onPreviewKeyEvent { event ->
+                if (event.type != KeyEventType.KeyDown) return@onPreviewKeyEvent false
+                when (event.key) {
+                    Key.DirectionDown -> {
+                        if (songs.isNotEmpty()) onCursorMove((cursorIndex + 1).coerceAtMost(songs.size - 1))
+                        true
+                    }
+                    Key.DirectionUp -> {
+                        if (songs.isNotEmpty()) onCursorMove((cursorIndex - 1).coerceAtLeast(0))
+                        true
+                    }
+                    Key.Enter, Key.NumPadEnter -> {
+                        if (songs.isNotEmpty()) onSongSelect(cursorIndex.coerceIn(0, songs.size - 1))
+                        true
+                    }
+                    Key.Spacebar, Key.MediaPlayPause -> {
+                        triggerPlayPause()
+                        true
+                    }
+                    Key.MediaPlay -> {
+                        if (!isPlaying) triggerPlayPause()
+                        true
+                    }
+                    Key.MediaPause -> {
+                        if (isPlaying) triggerPlayPause()
+                        true
+                    }
+                    Key.DirectionRight -> {
+                        onForward()
+                        true
+                    }
+                    Key.DirectionLeft -> {
+                        onRewind()
+                        true
+                    }
+                    Key.MediaNext -> {
+                        onNext()
+                        true
+                    }
+                    Key.MediaPrevious -> {
+                        onPrevious()
+                        true
+                    }
+                    Key.MediaStop -> {
+                        onStop()
+                        true
+                    }
+                    else -> false
+                }
+            }
     ) {
         Column(
             horizontalAlignment = Alignment.CenterHorizontally,
@@ -332,14 +412,11 @@ fun AdlibMediaPlayer(
             PlaylistView(
                 songs = songs,
                 selectedSongIndex = selectedSongIndex,
+                cursorIndex = cursorIndex,
+                onCursorMove = onCursorMove,
                 onSongSelect = onSongSelect,
                 modifier = Modifier.weight(1f)
             )
-            val currentSong = if (songs.isNotEmpty() && selectedSongIndex < songs.size) {
-                songs[selectedSongIndex]
-            } else {
-                null
-            }
             PlaybackProgress(
                 songTitle = currentSong?.title ?: "No Songs Found",
                 progress = progress,
@@ -347,9 +424,7 @@ fun AdlibMediaPlayer(
             )
             PlayerControls(
                 isPlaying = isPlaying,
-                onPlayPause = {
-                    currentSong?.let { onPlayPause(it) }
-                },
+                onPlayPause = { triggerPlayPause() },
                 onNext = onNext,
                 onPrevious = onPrevious,
                 onForward = onForward,
@@ -466,17 +541,30 @@ fun PlayerControls(
 fun PlaylistView(
     songs: List<Song>,
     selectedSongIndex: Int,
+    cursorIndex: Int,
+    onCursorMove: (Int) -> Unit,
     onSongSelect: (Int) -> Unit,
     modifier: Modifier = Modifier
 ) {
+    val listState = rememberLazyListState()
+
+    LaunchedEffect(cursorIndex) {
+        if (cursorIndex in songs.indices) {
+            listState.animateScrollToItem(cursorIndex)
+        }
+    }
+
     LazyColumn(
+        state = listState,
         modifier = modifier.fillMaxWidth()
     ) {
         items(songs.size) { index ->
             PlaylistItem(
                 song = songs[index].title,
-                isSelected = index == selectedSongIndex,
-                onClick = { onSongSelect(index) }
+                isPlaying = index == selectedSongIndex,
+                isCursor = index == cursorIndex,
+                onClick = { onCursorMove(index) },
+                onDoubleClick = { onSongSelect(index) }
             )
         }
     }
@@ -485,24 +573,29 @@ fun PlaylistView(
 @Composable
 fun PlaylistItem(
     song: String,
-    isSelected: Boolean,
+    isPlaying: Boolean,
+    isCursor: Boolean,
     onClick: () -> Unit,
+    onDoubleClick: () -> Unit,
     modifier: Modifier = Modifier
 ) {
-    val backgroundColor = if (isSelected) Color.White.copy(alpha = 0.1f) else Color.Transparent
+    val backgroundColor = if (isCursor) Color.White.copy(alpha = 0.15f) else Color.Transparent
 
     Column(
         modifier = modifier
             .fillMaxWidth()
             .background(backgroundColor)
-            .pointerInput(onClick) {
-                detectTapGestures(onDoubleTap = { onClick() })
+            .pointerInput(onClick, onDoubleClick) {
+                detectTapGestures(
+                    onTap = { onClick() },
+                    onDoubleTap = { onDoubleClick() }
+                )
             }
     ) {
         HorizontalDivider(color = Color.Gray.copy(alpha = 0.5f))
         Text(
             text = song,
-            color = if (isSelected) Color.White else Color.Green,
+            color = if (isPlaying) Color.White else Color.Green,
             modifier = Modifier
                 .padding(horizontal = 16.dp, vertical = 12.dp)
                 .fillMaxWidth()
@@ -519,6 +612,8 @@ fun GreetingPreview() {
             progress = 0.5f,
             isPlaying = false,
             selectedSongIndex = 0,
+            cursorIndex = 0,
+            onCursorMove = {},
             onSongSelect = {},
             onRescan = {},
             onPlayPause = {},
