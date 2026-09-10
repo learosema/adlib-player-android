@@ -16,14 +16,29 @@ class MidiPlayer(private val audioPlayer: AudioPlayer) : SimpleBasePlayer(Looper
     private var playWhenReady = false
     private var playbackState = Player.STATE_IDLE
     private val handler = Handler(Looper.getMainLooper())
+    private val positionUpdateIntervalMs = 200L
+    private val positionUpdateRunnable = object : Runnable {
+        override fun run() {
+            if (playWhenReady && audioPlayer.isPlaying) {
+                invalidateState()
+            }
+            handler.postDelayed(this, positionUpdateIntervalMs)
+        }
+    }
 
     init {
         audioPlayer.onPlaybackStopped = {
-            handler.post { 
+            handler.post {
                 playbackState = Player.STATE_IDLE
-                invalidateState() 
+                invalidateState()
             }
         }
+        handler.post(positionUpdateRunnable)
+    }
+
+    override fun handleRelease(): ListenableFuture<*> {
+        handler.removeCallbacks(positionUpdateRunnable)
+        return Futures.immediateVoidFuture()
     }
 
     override fun getState(): State {
